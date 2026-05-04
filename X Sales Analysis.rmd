@@ -1,0 +1,471 @@
+---
+title: "X Sales Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(caret)
+library(car)
+library(broom)
+library(readr)
+library(hexbin)
+library(rstanarm)
+library(bayestestR)
+library(insight)
+```
+
+## 1. Load and Clean Data
+
+```{r load-clean-data}
+parse_currency <- function(x) {
+  x_chr <- as.character(x)
+  sign <- if_else(str_detect(x_chr, "\\("), -1, 1)
+  value <- str_remove_all(x_chr, "\\$|,|\\(|\\)") %>% as.numeric()
+  value * sign
+}
+
+eyewear_raw <- read_csv("X 2023-2025 Selling PROJECT.csv.csv") %>%
+  clean_names()
+
+# Optional account lookup before anonymizing accounts
+account_lookup <- eyewear_raw %>%
+  distinct(account) %>%
+  arrange(account) %>%
+  mutate(account_code = LETTERS[row_number()])
+
+eyewear <- eyewear_raw %>%
+  left_join(account_lookup, by = "account") %>%
+  mutate(
+    true_msrp = parse_currency(true_msrp),
+    aur = parse_currency(aur),
+    sales_dollars = parse_currency(sales_dollars),
+    oh = parse_currency(oh),
+    sales_units = as.numeric(sales_units),
+    oh_u = as.numeric(oh_u),
+    wed = mdy(wed),
+    week = isoweek(wed),
+    week_sunday = as.integer(strftime(wed, format = "%U")) + 1,
+    month = month(wed, label = TRUE),
+    quarter = quarter(wed),
+    season = case_when(
+      month %in% c("Dec", "Jan", "Feb") ~ "Winter",
+      month %in% c("Mar", "Apr", "May") ~ "Spring",
+      month %in% c("Jun", "Jul", "Aug") ~ "Summer",
+      month %in% c("Sep", "Oct", "Nov") ~ "Fall",
+      TRUE ~ NA_character_
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    account_original = account,
+    account = factor(account_code),
+    msrp_bin = case_when(
+      true_msrp < 100 ~ "<$100",
+      true_msrp >= 100 & true_msrp < 150 ~ "$100–149",
+      true_msrp >= 150 & true_msrp < 200 ~ "$150–199",
+      true_msrp >= 200 ~ "$200+",
+      TRUE ~ NA_character_
+    ),
+    aur_bin = case_when(
+      aur < 100 ~ "<$100",
+      aur >= 100 & aur < 150 ~ "$100–149",
+      aur >= 150 & aur < 200 ~ "$150–199",
+      aur >= 200 ~ "$200+",
+      TRUE ~ NA_character_
+    ),
+    msrp_bin = factor(msrp_bin, levels = c("<$100", "$100–149", "$150–199", "$200+")),
+    aur_bin = factor(aur_bin, levels = c("<$100", "$100–149", "$150–199", "$200+")),
+    aur_z = as.numeric(scale(aur)),
+    true_msrp_z = as.numeric(scale(true_msrp))
+  )
+
+glimpse(eyewear)
+summary(eyewear)
+```
+
+## 2. Exploratory Analysis
+
+### Sales Units by Season
+
+```{r sales-units-season}
+ggplot(eyewear, aes(x = season, y = sales_units)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(
+    title = "Sales Units Distribution by Season",
+    x = "Season",
+    y = "Sales Units"
+  ) +
+  theme_minimal()
+```
+
+### AUR vs. MSRP by Account
+
+```{r aur-msrp-account}
+ggplot(eyewear, aes(x = true_msrp, y = aur, color = account)) +
+  geom_point(size = 1.2, alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "AUR vs. MSRP by Account",
+    x = "MSRP ($)",
+    y = "AUR ($)",
+    color = "Account"
+  ) +
+  theme_minimal()
+```
+
+### AUR vs. MSRP Density
+
+```{r aur-msrp-density}
+ggplot(eyewear, aes(x = true_msrp, y = aur)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_density_2d() +
+  labs(
+    title = "2D Density Plot of AUR vs. MSRP",
+    x = "MSRP ($)",
+    y = "AUR ($)"
+  ) +
+  theme_light()
+```
+
+### AUR vs. MSRP Hexbin
+
+```{r aur-msrp-hexbin}
+ggplot(eyewear, aes(x = true_msrp, y = aur)) +
+  stat_binhex(bins = 20) +
+  scale_fill_continuous(type = "viridis") +
+  labs(
+    title = "Hexbin Plot of AUR vs. MSRP",
+    x = "MSRP ($)",
+    y = "AUR ($)",
+    fill = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 3. Phase-Level Performance
+
+```{r phase-data}
+eyewear_ab <- eyewear %>%
+  filter(phase %in% c("A", "B"))
+```
+
+### Sales Units by Account and Phase
+
+```{r account-phase-sales}
+account_phase_summary <- eyewear_ab %>%
+  group_by(account, phase) %>%
+  summarise(total_sales_units = sum(sales_units, na.rm = TRUE), .groups = "drop")
+
+phase_colors <- c("A" = "#6BAED6", "B" = "#2171B5")
+
+ggplot(account_phase_summary, aes(x = account, y = total_sales_units, fill = phase)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  scale_fill_manual(values = phase_colors) +
+  labs(
+    title = "Sales Units by Account and Phase",
+    x = "Account",
+    y = "Total Sales Units",
+    fill = "Phase"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+### Weekly Sales Units by Phase
+
+```{r weekly-sales-phase}
+weekly_sales <- eyewear_ab %>%
+  group_by(phase, week_sunday) %>%
+  summarise(total_units = sum(sales_units, na.rm = TRUE), .groups = "drop")
+
+ggplot(weekly_sales, aes(x = week_sunday, y = total_units, color = phase)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = phase_colors) +
+  labs(
+    title = "Weekly Sales Units by Phase",
+    x = "Week Number, Starting Sunday",
+    y = "Total Sales Units",
+    color = "Phase"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## 4. Product Attribute Analysis
+
+### Sales Units by Shape
+
+```{r shape-sales}
+shape_summary <- eyewear_ab %>%
+  group_by(phase, shape) %>%
+  summarise(total_sales_units = sum(sales_units, na.rm = TRUE), .groups = "drop")
+
+ggplot(shape_summary, aes(x = total_sales_units, y = reorder(shape, total_sales_units), fill = phase)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = phase_colors) +
+  labs(
+    title = "Total Sales Units by Shape",
+    x = "Total Sales Units",
+    y = "Shape",
+    fill = "Phase"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+### Shape, Material, Lens, and Frame Model
+
+```{r product-attribute-model}
+eyewear_attributes <- eyewear %>%
+  filter(
+    !is.na(sales_units),
+    !is.na(shape),
+    !is.na(material),
+    !is.na(lense),
+    !is.na(frame),
+    frame != "N/A",
+    lense != "N/A"
+  )
+
+model_shape_material_color <- lm(
+  sales_units ~ shape + material + lense + frame,
+  data = eyewear_attributes
+)
+
+summary(model_shape_material_color)
+```
+
+### Shape Coefficients
+
+```{r shape-coefficients}
+tidy(model_shape_material_color) %>%
+  filter(str_detect(term, "shape")) %>%
+  mutate(term = str_remove(term, "shape")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "dodgerblue") +
+  coord_flip() +
+  labs(
+    title = "Estimated Effect of Shape on Sales Units",
+    x = "Shape",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+### Material Coefficients
+
+```{r material-coefficients}
+tidy(model_shape_material_color) %>%
+  filter(str_detect(term, "material")) %>%
+  mutate(term = str_remove(term, "material")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Estimated Effect of Material on Sales Units",
+    x = "Material",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+### Frame Color Coefficients
+
+```{r frame-coefficients}
+tidy(model_shape_material_color) %>%
+  filter(str_detect(term, "frame")) %>%
+  mutate(term = str_remove(term, "frame")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "mediumorchid") +
+  coord_flip() +
+  labs(
+    title = "Estimated Effect of Frame Color on Sales Units",
+    x = "Frame Color",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+### Lens Color Coefficients
+
+```{r lens-coefficients}
+tidy(model_shape_material_color) %>%
+  filter(str_detect(term, "lense")) %>%
+  mutate(term = str_remove(term, "lense")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "seagreen") +
+  coord_flip() +
+  labs(
+    title = "Estimated Effect of Lens Color on Sales Units",
+    x = "Lens Color",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+## 5. Main Sales Units Model
+
+```{r main-sales-units-model}
+eyewear_model_data <- eyewear %>%
+  filter(phase %in% c("A", "B")) %>%
+  drop_na(sales_units, aur, true_msrp, promo_status, shape, material, lense, frame, season, account)
+
+model_units <- lm(
+  sales_units ~ aur_z + true_msrp_z + promo_status + shape + material + lense + frame + season + account,
+  data = eyewear_model_data
+)
+
+summary(model_units)
+vif(model_units)
+```
+
+### Main Model Coefficients
+
+```{r main-model-coefficients}
+tidy(model_units) %>%
+  filter(str_detect(term, "shape|material|promo_status|season|account")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Estimated Drivers of Sales Units",
+    x = "Variable",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+## 6. Price-Binned Models
+
+### Sales Units by AUR and MSRP Bins
+
+```{r price-bin-model-units}
+model_units_binned <- lm(
+  sales_units ~ aur_bin + msrp_bin + promo_status + shape + material,
+  data = eyewear
+)
+
+summary(model_units_binned)
+```
+
+### AUR Bin Impact on Sales Units
+
+```{r aur-bin-units}
+tidy(model_units_binned) %>%
+  filter(str_detect(term, "aur_bin")) %>%
+  mutate(term = str_replace_all(term, "aur_bin", "AUR: ")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "dodgerblue") +
+  coord_flip() +
+  labs(
+    title = "Impact of AUR Bin on Sales Units",
+    x = "AUR Bin",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+### MSRP Bin Impact on Sales Units
+
+```{r msrp-bin-units}
+tidy(model_units_binned) %>%
+  filter(str_detect(term, "msrp_bin")) %>%
+  mutate(term = str_replace_all(term, "msrp_bin", "MSRP: ")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Impact of MSRP Bin on Sales Units",
+    x = "MSRP Bin",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+### Sales Dollars by AUR and MSRP Bins
+
+```{r price-bin-model-dollars}
+model_dollars_binned <- lm(
+  sales_dollars ~ aur_bin + msrp_bin + promo_status + shape + material,
+  data = eyewear
+)
+
+summary(model_dollars_binned)
+```
+
+```{r aur-bin-dollars}
+tidy(model_dollars_binned) %>%
+  filter(str_detect(term, "aur_bin")) %>%
+  mutate(term = str_replace_all(term, "aur_bin", "AUR: ")) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "darkblue") +
+  coord_flip() +
+  labs(
+    title = "Impact of AUR Bin on Sales Dollars",
+    x = "AUR Bin",
+    y = "Estimated Coefficient"
+  ) +
+  theme_minimal()
+```
+
+## 7. Bayesian High-Performer Model
+
+```{r bayesian-high-performer}
+eyewear_bayes <- eyewear %>%
+  drop_na(sales_units, msrp_bin) %>%
+  mutate(
+    high_performer = if_else(
+      sales_units >= quantile(sales_units, 0.75, na.rm = TRUE),
+      1,
+      0
+    )
+  )
+
+bayes_model_eyewear <- stan_glm(
+  high_performer ~ msrp_bin,
+  data = eyewear_bayes,
+  family = binomial(link = "logit"),
+  seed = 123,
+  chains = 2,
+  refresh = 0
+)
+
+summary(bayes_model_eyewear)
+prior_summary(bayes_model_eyewear)
+```
+
+### Posterior Distribution for $200+ MSRP Bin
+
+```{r bayesian-posterior-plot}
+posterior_eyewear <- get_parameters(bayes_model_eyewear)
+
+posterior_col <- names(posterior_eyewear)[str_detect(names(posterior_eyewear), "msrp_bin\\$200\\+")]
+
+if (length(posterior_col) == 1) {
+  ggplot(posterior_eyewear, aes(x = .data[[posterior_col]])) +
+    geom_density(fill = "steelblue") +
+    geom_vline(xintercept = mean(posterior_eyewear[[posterior_col]]), color = "red") +
+    geom_vline(xintercept = median(posterior_eyewear[[posterior_col]]), color = "blue") +
+    labs(
+      title = "Posterior Distribution for MSRP Bin: $200+",
+      x = "Estimated Effect",
+      y = "Density"
+    ) +
+    theme_minimal()
+}
+```
+
+```{r bayesian-diagnostics}
+hdi(bayes_model_eyewear, ci = 0.89)
+rope(bayes_model_eyewear)
+describe_posterior(bayes_model_eyewear)
+```
+
+## 8. Business Takeaways
+
+The analysis evaluates X sales performance across pricing, account, phase, seasonality, and product attributes. The key objective is to identify which factors are associated with stronger sales units and sales dollars.
+
+The exploratory visuals show how sales units vary by season, how AUR aligns with MSRP, and how performance changes across account and phase. The regression models estimate the relative contribution of price bands, promotion status, product shape, material, frame color, lens color, season, and account.
+
+The cleaned model structure supports a more defensible merchandising readout: sales performance is not driven by price alone. It reflects a combination of account mix, promotional context, product design attributes, and seasonal timing.
